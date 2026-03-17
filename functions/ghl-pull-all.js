@@ -72,8 +72,11 @@ function mapOpp(opp, contact) {
     ? `${contact.firstName || ''} ${contact.lastName || ''}`.trim()
     : (opp.name || opp.contactName || 'Unknown');
   const [firstName, ...rest] = name.split(' ');
+
+  // Try stage name first, fall back to status
   const stageName = opp.pipelineStage?.name || opp.status || 'open';
   const arenaStage = GHL_TO_ARENA[stageName] || '🆕 Inbound New Lead';
+
   return {
     id:            opp.id,
     ghlId:         opp.id,
@@ -103,24 +106,35 @@ function mapOpp(opp, contact) {
 export async function handler(event) {
   const headers = { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' };
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
-  if (!GHL_API_KEY) return { statusCode: 500, headers, body: JSON.stringify({ ok: false, error: 'GHL_API_KEY not set' }) };
-  if (!SB_KEY) return { statusCode: 500, headers, body: JSON.stringify({ ok: false, error: 'SUPABASE_SERVICE_KEY not set' }) };
 
+  console.log('GHL Pull All started. PIPELINE_ID:', PIPELINE_ID, 'LOCATION_ID:', LOCATION_ID);
+  console.log('GHL_API_KEY set:', !!GHL_API_KEY, 'SB_KEY set:', !!SB_KEY);
+
+  if (!GHL_API_KEY) return { statusCode: 500, headers, body: JSON.stringify({ ok: false, error: 'GHL_API_KEY not set' }) };
+  if (!SB_KEY)      return { statusCode: 500, headers, body: JSON.stringify({ ok: false, error: 'SUPABASE_SERVICE_KEY not set' }) };
+
+  // Fetch all opportunities from pipeline
   let allOpps = [];
   let page = 1;
   while (true) {
     const data = await ghlFetch(`/opportunities/search?location_id=${LOCATION_ID}&pipeline_id=${PIPELINE_ID}&limit=100&page=${page}`);
     if (!data) break;
     const opps = data.opportunities || [];
+    console.log(`Page ${page}: ${opps.length} opportunities`);
     allOpps = allOpps.concat(opps);
     if (opps.length < 100) break;
     page++;
   }
 
-  if (!allOpps.length) return { statusCode: 200, headers, body: JSON.stringify({ ok: true, synced: 0 }) };
+  console.log('Total opportunities fetched:', allOpps.length);
+  if (!allOpps.length) {
+    return { statusCode: 200, headers, body: JSON.stringify({ ok: true, synced: 0, message: 'No opportunities found in pipeline' }) };
+  }
 
+  // Fetch contacts in parallel batches of 5
   const contactCache = {};
   const contactIds = [...new Set(allOpps.map(o => o.contactId).filter(Boolean))];
+  console.log('Fetching', contactIds.length, 'contacts');
   for (let i = 0; i < contactIds.length; i += 5) {
     const batch = contactIds.slice(i, i + 5);
     await Promise.all(batch.map(async id => {
@@ -131,7 +145,10 @@ export async function handler(event) {
     }));
   }
 
+  // Load existing pipeline data to preserve Arena-only fields
   const pipelineData = (await sbGet(PIPELINE_KEY)) || {};
+
+  // Build lookup of existing leads by ghlId
   const existingByGhlId = {};
   for (const [member, md] of Object.entries(pipelineData)) {
     for (const lead of (md?.leads || [])) {
@@ -139,12 +156,16 @@ export async function handler(event) {
     }
   }
 
+  // Map and upsert all opportunities
+  // Group by assigned user → try to match to Arena member
   const arenaMembers = Object.keys(pipelineData).filter(k => Array.isArray(pipelineData[k]?.leads));
-  let synced = 0;
 
+  let synced = 0;
   for (const opp of allOpps) {
     const contact = contactCache[opp.contactId] || null;
     const newLead = mapOpp(opp, contact);
+
+    // Find target Arena member
     const assignedName = opp.user?.name || opp.assignedTo || '';
     let targetMember = arenaMembers.find(m =>
       assignedName && (
@@ -152,8 +173,15 @@ export async function handler(event) {
         assignedName.toLowerCase().includes(m.toLowerCase().split(' ')[0])
       )
     );
-    if (!targetMember && existingByGhlId[opp.id]) targetMember = existingByGhlId[opp.id].member;
+
+    // If no match, check if lead already exists somewhere
+    if (!targetMember && existingByGhlId[opp.id]) {
+      targetMember = existingByGhlId[opp.id].member;
+    }
+
+    // Last resort — use assigned name as key or '_ghl_unassigned'
     if (!targetMember) targetMember = assignedName || '_ghl_unassigned';
+
     if (!pipelineData[targetMember]) pipelineData[targetMember] = { leads: [] };
     if (!Array.isArray(pipelineData[targetMember].leads)) pipelineData[targetMember].leads = [];
 
@@ -162,7 +190,14 @@ export async function handler(event) {
       const kept = existing.lead;
       const idx = pipelineData[existing.member].leads.findIndex(l => l.ghlId === opp.id);
       if (idx !== -1) {
-        pipelineData[existing.member].leads[idx] = { ...kept, ...newLead, followUpDate: kept.followUpDate || '', callDate: kept.callDate || '', notes: newLead.notes || kept.notes || '', activityLog: kept.activityLog || [] };
+        pipelineData[existing.member].leads[idx] = {
+          ...kept,
+          ...newLead,
+          followUpDate: kept.followUpDate || '',
+          callDate:     kept.callDate     || '',
+          notes:        newLead.notes     || kept.notes || '',
+          activityLog:  kept.activityLog  || [],
+        };
       }
     } else {
       pipelineData[targetMember].leads.push(newLead);
@@ -170,6 +205,12 @@ export async function handler(event) {
     synced++;
   }
 
-  await sbSet(PIPELINE_KEY, pipelineData);
-  return { statusCode: 200, headers, body: JSON.stringify({ ok: true, synced, total: allOpps.length }) };
+  const saved = await sbSet(PIPELINE_KEY, pipelineData);
+  console.log('Saved to Supabase:', saved, 'synced:', synced);
+
+  return {
+    statusCode: 200,
+    headers,
+    body: JSON.stringify({ ok: true, synced, total: allOpps.length, saved }),
+  };
 }
